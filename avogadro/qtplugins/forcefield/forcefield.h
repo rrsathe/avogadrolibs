@@ -7,6 +7,7 @@
 #define AVOGADRO_QTPLUGINS_FORCEFIELD_H
 
 #include <avogadro/qtgui/extensionplugin.h>
+#include <avogadro/qtplugins/forcefield/computemanager.h>
 
 #include <QtCore/QMultiMap>
 #include <QtCore/QStringList>
@@ -79,6 +80,7 @@ private slots:
 private:
   QList<QAction*> m_actions;
   QtGui::Molecule* m_molecule = nullptr;
+  std::unique_ptr<ComputeManager> m_computeManager;
   Calc::EnergyCalculator* m_method = nullptr;
   std::string m_methodName;
   bool m_autodetect;

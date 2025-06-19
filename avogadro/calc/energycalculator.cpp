@@ -4,33 +4,38 @@
 ******************************************************************************/
 
 #include "energycalculator.h"
+#include "parallelcalc.h"
 
 #include <iostream>
+#include <thread>
 
 namespace Avogadro::Calc {
 
 void EnergyCalculator::gradient(const TVector& x, TVector& grad)
 {
-  finiteGradient(x, grad);
-  cleanGradients(grad);
+  // Use lambda to capture this for value calculations
+  auto valueFunc = [this](const TVector& pos) { return this->value(pos); };
+
+  // Get optimal thread count
+  int nThreads = std::thread::hardware_concurrency();
+
+  // Use parallel implementation with accuracy level 0 (basic accuracy)
+  // The last parameter (nThreads) controls parallel execution
+  ParallelCalc::finiteGradientParallel(valueFunc, x, grad, 0, nThreads);
+
+  // Clean gradients and apply mask using same thread count
+  if (m_mask.size() > 0) {
+    ParallelCalc::cleanGradientsParallel(grad, m_mask, nThreads);
+  }
 }
 
 void EnergyCalculator::cleanGradients(TVector& grad)
 {
-  unsigned int size = grad.rows();
-  // check for overflows -- in case of divide by zero, etc.
-  for (unsigned int i = 0; i < size; ++i) {
-    if (!std::isfinite(grad[i]) || std::isnan(grad[i])) {
-      grad[i] = 0.0;
-    }
+  // Only clean and mask if we have a valid mask
+  if (m_mask.size() > 0) {
+    int nThreads = std::thread::hardware_concurrency();
+    ParallelCalc::cleanGradientsParallel(grad, m_mask, nThreads);
   }
-
-  // freeze any masked atoms or coordinates
-  if (m_mask.rows() == size)
-    grad = grad.cwiseProduct(m_mask);
-  else
-    std::cerr << "Error: mask size " << m_mask.rows() << " " << grad.rows()
-              << std::endl;
 }
 
 } // namespace Avogadro::Calc
