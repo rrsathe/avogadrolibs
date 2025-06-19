@@ -4,9 +4,12 @@
 ******************************************************************************/
 
 #include "forcefield.h"
+#include "computemanager.h"
 #include "forcefielddialog.h"
 #include "obmmenergy.h"
 #include "scriptenergy.h"
+
+#include <avogadro/calc/parallelcalc.h>
 
 #ifdef BUILD_GPL_PLUGINS
 #include "obenergy.h"
@@ -54,7 +57,8 @@ const int constraintAction = 5;
 const int forcesAction = 6;
 
 Forcefield::Forcefield(QObject* parent_)
-  : ExtensionPlugin(parent_), m_method(nullptr)
+  : ExtensionPlugin(parent_),
+    m_computeManager(std::make_unique<ComputeManager>())
 {
   QSettings settings;
   settings.beginGroup("forcefield");
@@ -239,142 +243,134 @@ void Forcefield::setupMethod()
 
 void Forcefield::optimize()
 {
-  if (m_molecule == nullptr)
-    return;
-
-  if (m_method == nullptr)
-    setupMethod();
-  if (m_method == nullptr)
-    return; // bad news
-
-  if (!m_molecule->atomCount()) {
+  if (m_molecule == nullptr || !m_molecule->atomCount()) {
     QMessageBox::information(nullptr, tr("Avogadro"),
                              tr("No atoms provided for optimization"));
     return;
   }
+
+  if (m_method == nullptr)
+    setupMethod();
+  if (m_method == nullptr)
+    return;
 
   // merge all coordinate updates into one step for undo
   bool isInteractive = m_molecule->undoMolecule()->isInteractive();
   m_molecule->undoMolecule()->setInteractive(true);
 
   cppoptlib::LbfgsSolver<EnergyCalculator> solver;
-
-  auto n = m_molecule->atomCount();
+  const Eigen::Index atomCount =
+    static_cast<Eigen::Index>(m_molecule->atomCount());
+  const Eigen::Index dimension = 3 * atomCount;
 
   // double-check the mask
   auto mask = m_molecule->frozenAtomMask();
-  if (mask.rows() != static_cast<Eigen::Index>(3 * n)) {
-    // set the mask to all ones
-    mask = Eigen::VectorXd::Ones(static_cast<Eigen::Index>(3 * n));
+  if (mask.rows() != dimension) {
+    mask = Eigen::VectorXd::Ones(dimension);
   }
   m_method->setMolecule(m_molecule);
   m_method->setMask(mask);
 
-  // we have to cast the current 3d positions into a VectorXd
+  // Set up positions vector
   Core::Array<Vector3> pos = m_molecule->atomPositions3d();
-  double* p = pos[0].data();
-  Eigen::Map<Eigen::VectorXd> map(p, 3 * n);
-  Eigen::VectorXd positions = map;
+  Eigen::VectorXd positions =
+    Eigen::Map<Eigen::VectorXd>(pos[0].data(), dimension);
   Eigen::VectorXd lastPositions = positions;
 
-  Eigen::VectorXd gradient = Eigen::VectorXd::Zero(3 * n);
-  // just to get the right size / shape
-  // we'll use this to draw the force arrows later
+  // Initialize gradient and forces arrays
+  Eigen::VectorXd gradient = Eigen::VectorXd::Zero(dimension);
   Core::Array<Vector3> forces = m_molecule->atomPositions3d();
 
-  // Create a Criteria class so we can update coords every N steps
+  // Set up optimization criteria
   cppoptlib::Criteria<Real> crit = cppoptlib::Criteria<Real>::defaults();
-
-  // e.g., every N steps, update coordinates
   crit.iterations = 2;
-  // we don't set function or gradient criteria
-  // .. these seem to be broken in the solver code
-  // .. so we handle ourselves
   solver.setStopCriteria(crit);
 
-  Real energy = m_method->value(positions);
-  m_method->gradient(positions, gradient);
+  m_computeManager->setCalculator(m_method);
 
-  // debug the gradients
+  // Initial energy and gradient calculation using parallel computation
+  auto [energy, initialGradient] = m_computeManager->computeEnergyAndGradients(
+    pos, m_method, ComputeManager::DefaultThreadCount);
+  gradient = initialGradient;
+
+  auto updateResult =
+    ComputeManager::updateAtomPositions(positions, atomCount, gradient);
+  if (updateResult.success) {
+    forces = updateResult.forces;
+  }
+
 #ifndef NDEBUG
-  for (Index i = 0; i < n; ++i) {
+  for (Eigen::Index i = 0; i < atomCount; ++i) {
     qDebug() << " atom " << i << " grad: " << gradient[3 * i] << ", "
              << gradient[3 * i + 1] << ", " << gradient[3 * i + 2];
   }
 #endif
 
   qDebug() << " initial " << energy << " gradNorm: " << gradient.norm();
-  qDebug() << " maxSteps" << m_maxSteps << " steps "
-           << m_maxSteps / crit.iterations;
 
+  const int progressMaxSteps = static_cast<int>(m_maxSteps / crit.iterations);
   QProgressDialog progress(tr("Optimize Geometry"), "Cancel", 0,
-                           m_maxSteps / crit.iterations);
+                           progressMaxSteps);
   progress.setWindowModality(Qt::WindowModal);
   progress.setMinimumDuration(0);
   progress.setAutoClose(true);
   progress.show();
 
-  Real currentEnergy = 0.0;
-  for (unsigned int i = 0; i < m_maxSteps / crit.iterations; ++i) {
+  Real currentEnergy = energy;
+  for (unsigned int step = 0; step < m_maxSteps / crit.iterations; ++step) {
     solver.minimize(*m_method, positions);
-    // update the progress dialog
-    progress.setValue(i);
+    progress.setValue(static_cast<int>(step));
 
     qApp->processEvents(QEventLoop::AllEvents, 500);
 
-    currentEnergy = m_method->value(positions);
+    // Update energy and gradients in parallel
+    auto [newEnergy, newGradient] = m_computeManager->computeEnergyAndGradients(
+      pos, m_method, ComputeManager::DefaultThreadCount);
+
+    currentEnergy = newEnergy;
+    gradient = newGradient;
+
     progress.setLabelText(
       tr("Energy: %L1", "force field energy").arg(currentEnergy, 0, 'f', 3));
-    // get the current gradient for force visualization
-    m_method->gradient(positions, gradient);
+
 #ifndef NDEBUG
-    qDebug() << " optimize " << i << currentEnergy
+    qDebug() << " optimize " << step << currentEnergy
              << " gradNorm: " << gradient.norm();
 #endif
 
-    // update coordinates
-    bool isFinite = std::isfinite(currentEnergy);
-    if (isFinite) {
-      const double* d = positions.data();
-      [[maybe_unused]] bool allFinite = true;
-      // casting back would be lovely...
-      for (Index j = 0; j < n; ++j) {
-        if (!std::isfinite(*d) || !std::isfinite(*(d + 1)) ||
-            !std::isfinite(*(d + 2))) {
-          allFinite = false;
-          break;
-        }
-
-        pos[j] = Vector3(*(d), *(d + 1), *(d + 2));
-        d += 3;
-
-        forces[j] = -0.1 * Vector3(gradient[3 * j], gradient[3 * j + 1],
-                                   gradient[3 * j + 2]);
+    if (std::isfinite(currentEnergy)) {
+      // Update coordinates with parallel operations
+      auto result =
+        ComputeManager::updateAtomPositions(positions, atomCount, gradient);
+      if (!result.success) {
+        qDebug() << "Non-finite positions detected, stopping optimization";
+        positions = lastPositions;
+        gradient = Eigen::VectorXd::Zero(dimension);
+        break;
       }
-    } else {
-      qDebug() << "Non-finite energy, stopping optimization";
-      // reset to last positions
-      positions = lastPositions;
-      gradient = Eigen::VectorXd::Zero(3 * n);
-      break;
-    }
 
-    // todo - merge these into one undo step
-    if (isFinite) {
+      pos = result.positions;
+      forces = result.forces;
+
+      // Update molecule state
       m_molecule->undoMolecule()->setAtomPositions3d(pos,
                                                      tr("Optimize Geometry"));
       m_molecule->setForceVectors(forces);
-      Molecule::MoleculeChanges changes = Molecule::Atoms | Molecule::Modified;
-      m_molecule->emitChanged(changes);
+      m_molecule->emitChanged(Molecule::Atoms | Molecule::Modified);
       lastPositions = positions;
 
-      // check for convergence
-      if (fabs(gradient.maxCoeff()) < m_gradientTolerance)
+      // Check convergence criteria
+      if (gradient.lpNorm<Eigen::Infinity>() < m_gradientTolerance)
         break;
       if (fabs(currentEnergy - energy) < m_tolerance)
         break;
 
       energy = currentEnergy;
+    } else {
+      qDebug() << "Non-finite energy, stopping optimization";
+      positions = lastPositions;
+      gradient = Eigen::VectorXd::Zero(dimension);
+      break;
     }
 
     if (progress.wasCanceled())
@@ -386,24 +382,23 @@ void Forcefield::optimize()
 
 void Forcefield::energy()
 {
-  if (m_molecule == nullptr)
+  if (m_molecule == nullptr || !m_molecule->atomCount())
     return;
 
   if (m_method == nullptr)
     setupMethod();
   if (m_method == nullptr)
-    return; // bad news
+    return;
 
-  int n = m_molecule->atomCount();
-  // we have to cast the current 3d positions into a VectorXd
+  // Set up positions vector
   Core::Array<Vector3> pos = m_molecule->atomPositions3d();
-  double* p = pos[0].data();
-  Eigen::Map<Eigen::VectorXd> map(p, 3 * n);
-  Eigen::VectorXd positions = map;
+  const Eigen::Index atomCount =
+    static_cast<Eigen::Index>(m_molecule->atomCount());
+  const Eigen::Index dimension = 3 * atomCount;
 
-  // now get the energy
-  m_method->setMolecule(m_molecule);
-  Real energy = m_method->value(positions);
+  // Calculate energy using parallel computation
+  auto [energy, gradient] = m_computeManager->computeEnergyAndGradients(
+    pos, m_method, ComputeManager::DefaultThreadCount);
 
   QString msg(tr("%1 Energy = %L2").arg(m_methodName.c_str()).arg(energy));
   QMessageBox::information(nullptr, tr("Avogadro"), msg);
@@ -411,53 +406,51 @@ void Forcefield::energy()
 
 void Forcefield::forces()
 {
-  if (m_molecule == nullptr)
+  if (m_molecule == nullptr || !m_molecule->atomCount())
     return;
 
   if (m_method == nullptr)
     setupMethod();
   if (m_method == nullptr)
-    return; // bad news
+    return;
 
-  auto n = m_molecule->atomCount();
+  const Eigen::Index atomCount =
+    static_cast<Eigen::Index>(m_molecule->atomCount());
+  const Eigen::Index dimension = 3 * atomCount;
 
   // double-check the mask
   auto mask = m_molecule->frozenAtomMask();
-  if (mask.rows() != 3 * n) {
-    mask = Eigen::VectorXd::Zero(3 * n);
-    // set to 1.0
-    for (Eigen::Index i = 0; i < 3 * n; ++i) {
-      mask[i] = 1.0;
-    }
+  if (mask.rows() != dimension) {
+    mask = Eigen::VectorXd::Ones(dimension);
   }
   m_method->setMolecule(m_molecule);
   m_method->setMask(mask);
+  m_computeManager->setCalculator(m_method);
 
-  // we have to cast the current 3d positions into a VectorXd
+  // Set up positions and forces arrays
   Core::Array<Vector3> pos = m_molecule->atomPositions3d();
-  double* p = pos[0].data();
-  Eigen::Map<Eigen::VectorXd> map(p, 3 * n);
-  Eigen::VectorXd positions = map;
-
-  Eigen::VectorXd gradient = Eigen::VectorXd::Zero(3 * n);
-  // just to get the right size / shape
-  // we'll use this to draw the force arrows
   Core::Array<Vector3> forces = m_molecule->atomPositions3d();
 
-  m_method->gradient(positions, gradient);
+  // Calculate energy and forces using parallel computation
+  auto [energy, gradient] = m_computeManager->computeEnergyAndGradients(
+    pos, m_method, ComputeManager::DefaultThreadCount);
 
-  for (Index i = 0; i < n; ++i) {
-    forces[i] =
-      -0.1 * Vector3(gradient[3 * i], gradient[3 * i + 1], gradient[3 * i + 2]);
+  // Update force vectors using parallel position update
+  auto result = ComputeManager::updateAtomPositions(
+    Eigen::Map<Eigen::VectorXd>(pos[0].data(), dimension), atomCount, gradient);
+
+  if (result.success) {
+    forces = result.forces;
+    m_molecule->setForceVectors(forces);
+    m_molecule->emitChanged(Molecule::Atoms | Molecule::Modified);
+
+    QString msg(
+      tr("%1 Force Norm = %L2").arg(m_methodName.c_str()).arg(gradient.norm()));
+    QMessageBox::information(nullptr, tr("Avogadro"), msg);
+  } else {
+    QMessageBox::warning(nullptr, tr("Avogadro"),
+                         tr("Error calculating forces"));
   }
-
-  m_molecule->setForceVectors(forces);
-  Molecule::MoleculeChanges changes = Molecule::Atoms | Molecule::Modified;
-  m_molecule->emitChanged(changes);
-
-  QString msg(
-    tr("%1 Force Norm = %L2").arg(m_methodName.c_str()).arg(gradient.norm()));
-  QMessageBox::information(nullptr, tr("Avogadro"), msg);
 }
 
 std::string Forcefield::recommendedForceField() const
@@ -467,7 +460,7 @@ std::string Forcefield::recommendedForceField() const
   if (m_molecule == nullptr || m_molecule->unitCell() != nullptr)
     return "LJ";
 
-  // otherwise, let's see what identifers are returned
+  // otherwise, let's see what identifiers are returned
   auto list =
     Calc::EnergyManager::instance().identifiersForMolecule(*m_molecule);
   if (list.empty())
@@ -475,11 +468,13 @@ std::string Forcefield::recommendedForceField() const
 
   // iterate to see what we have
   std::string bestOption;
-  for (auto option : list) {
+  for (const auto& option : list) {
     // GAFF is better than MMFF94 which is better than UFF
     if (option == "UFF" && bestOption != "GAFF" && bestOption != "MMFF94")
       bestOption = option;
     if (option == "MMFF94" && bestOption != "GAFF")
+      bestOption = option;
+    if (option == "GAFF")
       bestOption = option;
   }
   if (!bestOption.empty())
@@ -493,7 +488,7 @@ void Forcefield::freezeSelected()
   if (!m_molecule)
     return;
 
-  auto numAtoms = m_molecule->atomCount();
+  const auto numAtoms = m_molecule->atomCount();
   // now freeze the specified atoms
   for (Index i = 0; i < numAtoms; ++i) {
     if (m_molecule->atomSelected(i)) {
@@ -507,8 +502,8 @@ void Forcefield::unfreezeSelected()
   if (!m_molecule)
     return;
 
-  auto numAtoms = m_molecule->atomCount();
-  // now freeze the specified atoms
+  const auto numAtoms = m_molecule->atomCount();
+  // now unfreeze the specified atoms
   for (Index i = 0; i < numAtoms; ++i) {
     if (m_molecule->atomSelected(i)) {
       m_molecule->setFrozenAtom(i, false);
